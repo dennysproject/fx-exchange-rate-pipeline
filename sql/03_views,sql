@@ -1,0 +1,56 @@
+-- Run connected to fx_analytics as fx_etl.
+SET ROLE fx_etl;
+
+-- 1. Date table: one row per calendar day, for Power BI time analysis
+CREATE OR REPLACE VIEW fx.dim_date AS
+SELECT
+  d::date                      AS date_key,
+  EXTRACT(YEAR FROM d)::int    AS year_number,
+  EXTRACT(QUARTER FROM d)::int AS quarter_number,
+  EXTRACT(MONTH FROM d)::int   AS month_number,
+  TO_CHAR(d, 'Mon')            AS month_name,
+  TO_CHAR(d, 'YYYY-MM')        AS year_month,
+  EXTRACT(ISODOW FROM d)::int  AS weekday_number,
+  TO_CHAR(d, 'Dy')             AS weekday_name
+FROM generate_series(
+  (SELECT MIN(rate_date) FROM fx.fact_exchange_rate)::timestamp,
+  (SELECT MAX(rate_date) FROM fx.fact_exchange_rate)::timestamp,
+  interval '1 day'
+) AS d;
+
+-- 2. IDR per 1 unit of each currency (cross-rates from the EUR base)
+CREATE OR REPLACE VIEW fx.v_idr_rates AS
+WITH idr AS (
+  SELECT rate_date, rate AS eur_idr
+  FROM fx.fact_exchange_rate
+  WHERE base_code = 'EUR' AND quote_code = 'IDR'
+)
+SELECT f.rate_date,
+       f.quote_code AS currency_code,
+       c.currency_name,
+       ROUND(idr.eur_idr / f.rate, 4) AS idr_per_unit
+FROM fx.fact_exchange_rate f
+JOIN idr ON idr.rate_date = f.rate_date
+JOIN fx.dim_currency c ON c.currency_code = f.quote_code
+WHERE f.base_code = 'EUR' AND f.quote_code <> 'IDR'
+UNION ALL
+SELECT idr.rate_date, 'EUR', c.currency_name, idr.eur_idr
+FROM idr
+JOIN fx.dim_currency c ON c.currency_code = 'EUR';
+
+-- 3. Daily change and 30-day moving average
+CREATE OR REPLACE VIEW fx.v_idr_trend AS
+SELECT rate_date,
+       currency_code,
+       currency_name,
+       idr_per_unit,
+       LAG(idr_per_unit) OVER w AS prev_rate,
+       ROUND((idr_per_unit / NULLIF(LAG(idr_per_unit) OVER w, 0) - 1) * 100, 4) AS daily_change_pct,
+       CASE WHEN COUNT(*) OVER w30 = 30
+            THEN ROUND(AVG(idr_per_unit) OVER w30, 4)
+       END AS ma_30
+FROM fx.v_idr_rates
+WINDOW
+  w   AS (PARTITION BY currency_code ORDER BY rate_date),
+  w30 AS (PARTITION BY currency_code ORDER BY rate_date
+          ROWS BETWEEN 29 PRECEDING AND CURRENT ROW);
