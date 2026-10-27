@@ -21,3 +21,6 @@ CREATE TABLE IF NOT EXISTS fx.etl_run_log (
   status TEXT,
   message TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_fact_quote_date
+ON fx.fact_exchange_rate (quote_code, rate_date);
